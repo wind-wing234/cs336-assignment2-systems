@@ -11,6 +11,14 @@ from cs336_basics.model import BasicsTransformerLM
 from cs336_basics.data import get_batch
 from cs336_basics.nn_utils import cross_entropy
 
+model_sizes = {
+    "small": {"d_model": 768, "d_ff": 3072, "num_layers": 12, "num_heads": 12}, # 要3G左右的显存
+    "medium": {"d_model": 1024, "d_ff": 4096, "num_layers": 24, "num_heads": 16},
+    "large": {"d_model": 1280, "d_ff": 5120, "num_layers": 36, "num_heads": 20},
+    "xl": {"d_model": 1600, "d_ff": 6400, "num_layers": 48, "num_heads": 25}, # 要40G左右的显存
+    "2.7B": {"d_model": 2560, "d_ff": 10240, "num_layers": 32, "num_heads": 32} # 要60G左右的显存
+}
+
 
 def benchmark(description: str, runs: list[Callable], num_warmups: int, num_trials: int):
     """
@@ -93,13 +101,6 @@ def exp1():
     """
     对不同大小的模型进行基准测试，测量前向传递和前向+后向传递的时间
     """
-    model_sizes = {
-        "small": {"d_model": 768, "d_ff": 3072, "num_layers": 12, "num_heads": 12},
-        "medium": {"d_model": 1024, "d_ff": 4096, "num_layers": 24, "num_heads": 16},
-        "large": {"d_model": 1280, "d_ff": 5120, "num_layers": 36, "num_heads": 20},
-        "xl": {"d_model": 1600, "d_ff": 6400, "num_layers": 48, "num_heads": 25},
-        "2.7B": {"d_model": 2560, "d_ff": 10240, "num_layers": 32, "num_heads": 32}
-    }
     
     # 基准测试参数
     num_warmups = 5
@@ -161,6 +162,60 @@ def exp1():
     results_df.to_csv("results/exp1_timing_results.csv", index=False)
     return results_df
 
+def exp2():
+    """
+    在small观察未预热、预热1次、2次、5次的前向、反向传递时间
+    """
+    num_warmups = [0, 1, 2, 5]
+    num_steps = 10
+    results = []
+    model_size = "small"
+    for warmup in num_warmups:
+        print(f"Testing with {warmup} warmup(s)...")
+        forward, backward = run_LM(
+            d_model=model_sizes[model_size]["d_model"],
+            d_ff=model_sizes[model_size]["d_ff"],
+            num_layers=model_sizes[model_size]["num_layers"],
+            num_heads=model_sizes[model_size]["num_heads"]
+        )
+
+        runs = [forward, backward]
+        time_results = benchmark(
+            description=f"{model_size} model forward and backward with {warmup} warmup(s)",
+            runs=runs,
+            num_warmups=warmup,
+            num_trials=num_steps
+        )
+
+        forward_times = time_results[forward.__name__]
+        backward_times = time_results[backward.__name__]
+
+        forward_mean = np.mean(forward_times)
+        forward_std = np.std(forward_times)
+        backward_mean = np.mean(backward_times)
+        backward_std = np.std(backward_times)
+
+        results.append({
+            "Warmups": warmup,
+            "Forward Mean (s)": forward_mean,
+            "Forward Std (s)": forward_std,
+            "Backward Mean (s)": backward_mean,
+            "Backward Std (s)": backward_std
+        })
+
+        print(f"  Forward: {forward_mean:.4f}s ± {forward_std:.4f}s")
+        print(f"  Backward: {backward_mean:.4f}s ± {backward_std:.4f}s")
+    
+    # 创建DataFrame并返回
+    results_df = pd.DataFrame(results)
+    print("\n结果汇总：")
+    print(results_df)
+    
+    # 保存结果到csv文件
+    os.makedirs("results", exist_ok=True)
+    results_df.to_csv(f"results/exp2_{model_size}_timing_results.csv", index=False)
+    return results_df
+
 
 if __name__ == "__main__":
-    exp1()
+    exp2()
