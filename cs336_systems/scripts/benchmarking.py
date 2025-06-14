@@ -326,11 +326,12 @@ def exp3(model_size="2.7B", context_lengths=[128, 256, 512], profile_full_traini
         # 开始记录内存历史
         torch.cuda.memory._record_memory_history(max_entries=1000000)
         
+        for _ in range(5):  # 进行5次实际分析
         # 执行要分析的操作
-        forward()
-        if profile_full_training:
-            backward()
-            optimizer_step()
+            forward()
+            if profile_full_training:
+                backward()
+                optimizer_step()
             
         if torch.cuda.is_available():
             torch.cuda.synchronize()
