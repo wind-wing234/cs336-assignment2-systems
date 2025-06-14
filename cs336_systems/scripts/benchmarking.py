@@ -104,9 +104,19 @@ def run_LM_with_optimizer(
     num_heads: int,
     context_length: int = 256,
     batch_size: int = 4,
+    use_autocast: bool = False,
 ) -> tuple[Callable, Callable, Callable]:
     """
     返回"运行一次前向传播(+反向传播+优化器步骤)"的函数
+    
+    Args:
+        d_model: 模型维度
+        d_ff: 前馈网络维度
+        num_layers: 层数
+        num_heads: 注意力头数
+        context_length: 上下文长度
+        batch_size: 批量大小
+        use_autocast: 是否使用混合精度训练
     """
     # 默认参数
     vocab_size = 10000
@@ -126,13 +136,15 @@ def run_LM_with_optimizer(
     ).to(device=device)
 
     # 初始化优化器
-    # optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
     optimizer = AdamW(
         model.parameters(),
         lr=3e-4,
         betas=(0.9, 0.999),
         weight_decay=1e-2
     )
+
+    # 如果使用autocast，初始化梯度缩放器
+    scaler = torch.amp.GradScaler("cuda") if use_autocast else None
 
     # 获取输入batch
     dataset = np.load(dataset_path, mmap_mode='r+')
@@ -148,16 +160,31 @@ def run_LM_with_optimizer(
     
     def forward():
         nonlocal logits
-        logits = model(inputs)
+        if use_autocast and torch.cuda.is_available():
+            with torch.amp.autocast("cuda"):
+                logits = model(inputs)
+        else:
+            logits = model(inputs)
 
     def backward():
         nonlocal loss
-        loss = cross_entropy(logits, targets)
-        loss.backward()
+        if use_autocast and torch.cuda.is_available():
+            with torch.amp.autocast("cuda"):
+                loss = cross_entropy(logits, targets)
+            scaler.scale(loss).backward()
+        else:
+            loss = cross_entropy(logits, targets)
+            loss.backward()
     
     def optimizer_step():
-        clip_gradient(model.parameters(), max_norm=1.0)
-        optimizer.step()
+        if use_autocast and torch.cuda.is_available():
+            scaler.unscale_(optimizer)
+            clip_gradient(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            clip_gradient(model.parameters(), max_norm=1.0)
+            optimizer.step()
         optimizer.zero_grad()
     
     return forward, backward, optimizer_step
@@ -282,7 +309,7 @@ def exp2():
     results_df.to_csv(f"results/exp2_{model_size}_timing_results.csv", index=False)
     return results_df
 
-def exp3(model_size="2.7B", context_lengths=[128, 256, 512], profile_full_training=False):
+def exp3(model_size="2.7B", context_lengths=[128, 256, 512], profile_full_training=False, use_autocast=False):
     """
     对指定大小的模型进行内存分析，测量不同上下文长度下的内存使用情况
     
@@ -290,9 +317,10 @@ def exp3(model_size="2.7B", context_lengths=[128, 256, 512], profile_full_traini
         model_size: 模型大小名称，默认为"2.7B"
         context_lengths: 要测试的上下文长度列表
         profile_full_training: 如果为True，分析完整训练步骤；如果为False，仅分析前向传递
+        use_autocast: 是否使用混合精度训练
     """
     
-    print(f"内存分析: {model_size} model {'(完整训练步骤)' if profile_full_training else '(仅前向传递)'}")
+    print(f"内存分析: {model_size} model {'(完整训练步骤)' if profile_full_training else '(仅前向传递)'} {'使用混合精度' if use_autocast else '使用全精度'}")
     
     # 确保结果目录存在
     os.makedirs("results/memory_profiles", exist_ok=True)
@@ -309,7 +337,8 @@ def exp3(model_size="2.7B", context_lengths=[128, 256, 512], profile_full_traini
             d_ff=model_params["d_ff"],
             num_layers=model_params["num_layers"],
             num_heads=model_params["num_heads"],
-            context_length=context_length
+            context_length=context_length,
+            use_autocast=use_autocast
         )
         
         # 预热阶段
@@ -321,7 +350,6 @@ def exp3(model_size="2.7B", context_lengths=[128, 256, 512], profile_full_traini
         
         if torch.cuda.is_available():
             torch.cuda.synchronize()
-            # torch.cuda.empty_cache()
             
         # 开始记录内存历史
         torch.cuda.memory._record_memory_history(max_entries=1000000)
@@ -338,13 +366,15 @@ def exp3(model_size="2.7B", context_lengths=[128, 256, 512], profile_full_traini
         
         # 保存内存快照
         profile_type = "full_training" if profile_full_training else "inference"
-        output_file = f"results/memory_profiles/{model_size}_ctx{context_length}_{profile_type}.pickle"
+        precision_type = "mixed" if use_autocast else "full"
+        output_file = f"results/memory_profiles/{model_size}_ctx{context_length}_{profile_type}_{precision_type}.pickle"
         torch.cuda.memory._dump_snapshot(output_file)
         
         # 停止记录历史
         torch.cuda.memory._record_memory_history(enabled=None)
         
         print(f"已保存内存快照到 {output_file}")
+        torch.cuda.empty_cache()
         
     print("内存分析完成！")
     print("请使用PyTorch的内存可视化工具查看结果：https://pytorch.org/memory_viz")
@@ -353,8 +383,14 @@ def exp3(model_size="2.7B", context_lengths=[128, 256, 512], profile_full_traini
 if __name__ == "__main__":
     # exp2()
     
-    # 仅前向传递(推理)的内存分析
-    exp3(profile_full_training=False)
+    # 仅前向传递(推理)的内存分析 - 全精度
+    exp3(profile_full_training=False, use_autocast=False)
     
-    # 完整训练步骤的内存分析
-    exp3(profile_full_training=True)
+    # 仅前向传递(推理)的内存分析 - 混合精度
+    exp3(profile_full_training=False, use_autocast=True)
+    
+    # 完整训练步骤的内存分析 - 全精度
+    exp3(profile_full_training=True, use_autocast=False)
+    
+    # 完整训练步骤的内存分析 - 混合精度
+    exp3(profile_full_training=True, use_autocast=True)
