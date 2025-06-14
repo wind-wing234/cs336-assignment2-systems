@@ -5,7 +5,8 @@ from typing import Callable
 
 from cs336_basics.model import BasicsTransformerLM
 from cs336_basics.data import get_batch
-from cs336_basics.nn_utils import cross_entropy
+from cs336_basics.nn_utils import cross_entropy, clip_gradient
+from cs336_basics.optimizer import AdamW, get_cosine_lr
 
 
 model_sizes = {
@@ -43,32 +44,56 @@ def run_LM(
         rope_theta=rope_theta
     ).to(device=device)
 
-    # 获取输入batch
-    dataset = np.load(dataset_path, mmap_mode='r+')
-    inputs, targets = get_batch(
-        dataset=dataset,
-        batch_size=batch_size,
-        context_length=context_length,
-        device=device
+    # 初始化优化器
+    optimizer = AdamW(
+        model.parameters(),
+        lr=3e-4,
+        betas=(0.9, 0.999),
+        weight_decay=1e-2
     )
 
-    for step in range(num_warmups):
-        with nvtx.range(f"Warmup Step {step}"):
-            with nvtx.range("Forward Pass"):
-                logits = model(inputs)
-            with nvtx.range("Cross Entropy"):
-                loss = cross_entropy(logits, targets)
-            with nvtx.range("Backward Pass"):
-                loss.backward()
+    dataset = np.load(dataset_path, mmap_mode='r+')
 
-    for step in range(num_steps):
-        with nvtx.range(f"Step {step}"):
-            with nvtx.range("Forward Pass"):
-                logits = model(inputs)
-            with nvtx.range("Cross Entropy"):
-                loss = cross_entropy(logits, targets)
-            with nvtx.range("Backward Pass"):
-                loss.backward()
+    for step in range(1, num_warmups+num_steps+1):
+        if step <= num_warmups:
+            nvtx.range_push(f"Warmup Step {step}")
+        else:
+            nvtx.range_push(f"Training Step {step - num_warmups}")
+
+        with nvtx.range("Zero Gradients"):
+            optimizer.zero_grad()
+
+        with nvtx.range("Learning Rate Scheduler"):
+            lr_now = get_cosine_lr(
+                it=step,
+                max_learning_rate=3e-4,
+                min_learning_rate=3e-4 * 0.01,
+                warmup_iters=int(num_steps * 0.05),
+                cosine_cycle_iters=num_steps
+            )
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = lr_now
+
+        inputs, targets = get_batch(
+            dataset=dataset,
+            batch_size=batch_size,
+            context_length=context_length,
+            device=device
+        )
+
+        with nvtx.range("Forward Pass"):
+            logits = model(inputs)
+        with nvtx.range("Cross Entropy"):
+            loss = cross_entropy(logits, targets)
+        with nvtx.range("Backward Pass"):
+            loss.backward()
+        with nvtx.range("Clip Gradients"):
+            clip_gradient(model.parameters(), max_norm=1.0)
+        with nvtx.range("Optimizer Step"):
+            optimizer.step()
+        
+        nvtx.range_pop()  # Pop the range for the current step
+            
 
 
 
