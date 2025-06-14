@@ -9,7 +9,8 @@ import pandas as pd
 
 from cs336_basics.model import BasicsTransformerLM
 from cs336_basics.data import get_batch
-from cs336_basics.nn_utils import cross_entropy
+from cs336_basics.nn_utils import cross_entropy, clip_gradient
+from cs336_basics.optimizer import AdamW, get_cosine_lr
 
 model_sizes = {
     "small": {"d_model": 768, "d_ff": 3072, "num_layers": 12, "num_heads": 12}, # 要3G左右的显存
@@ -95,6 +96,71 @@ def run_LM(
         loss.backward()
     
     return forward, backward
+
+def run_LM_with_optimizer(
+    d_model: int,
+    d_ff: int,
+    num_layers: int,
+    num_heads: int,
+    context_length: int = 256,
+    batch_size: int = 4,
+) -> tuple[Callable, Callable, Callable]:
+    """
+    返回"运行一次前向传播(+反向传播+优化器步骤)"的函数
+    """
+    # 默认参数
+    vocab_size = 10000
+    rope_theta = 10000.0
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    dataset_path = "data/token/TinyStories_valid_10000_token_ids.npy"
+
+    # 初始化模型
+    model = BasicsTransformerLM(
+        vocab_size=vocab_size,
+        context_length=context_length,
+        d_model=d_model,
+        num_layers=num_layers,
+        num_heads=num_heads,
+        d_ff=d_ff,
+        rope_theta=rope_theta
+    ).to(device=device)
+
+    # 初始化优化器
+    # optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    optimizer = AdamW(
+        model.parameters(),
+        lr=3e-4,
+        betas=(0.9, 0.999),
+        weight_decay=1e-2
+    )
+
+    # 获取输入batch
+    dataset = np.load(dataset_path, mmap_mode='r+')
+    inputs, targets = get_batch(
+        dataset=dataset,
+        batch_size=batch_size,
+        context_length=context_length,
+        device=device
+    )
+
+    logits: torch.Tensor = None
+    loss: torch.Tensor = None
+    
+    def forward():
+        nonlocal logits
+        logits = model(inputs)
+
+    def backward():
+        nonlocal loss
+        loss = cross_entropy(logits, targets)
+        loss.backward()
+    
+    def optimizer_step():
+        clip_gradient(model.parameters(), max_norm=1.0)
+        optimizer.step()
+        optimizer.zero_grad()
+    
+    return forward, backward, optimizer_step
 
 
 def exp1():
@@ -216,6 +282,78 @@ def exp2():
     results_df.to_csv(f"results/exp2_{model_size}_timing_results.csv", index=False)
     return results_df
 
+def exp3(model_size="2.7B", context_lengths=[128, 256, 512], profile_full_training=False):
+    """
+    对指定大小的模型进行内存分析，测量不同上下文长度下的内存使用情况
+    
+    Args:
+        model_size: 模型大小名称，默认为"2.7B"
+        context_lengths: 要测试的上下文长度列表
+        profile_full_training: 如果为True，分析完整训练步骤；如果为False，仅分析前向传递
+    """
+    
+    print(f"内存分析: {model_size} model {'(完整训练步骤)' if profile_full_training else '(仅前向传递)'}")
+    
+    # 确保结果目录存在
+    os.makedirs("results/memory_profiles", exist_ok=True)
+    
+    # 获取模型参数
+    model_params = model_sizes[model_size]
+    
+    for context_length in context_lengths:
+        print(f"分析上下文长度: {context_length}")
+        
+        # 创建运行函数
+        forward, backward, optimizer_step = run_LM_with_optimizer(
+            d_model=model_params["d_model"],
+            d_ff=model_params["d_ff"],
+            num_layers=model_params["num_layers"],
+            num_heads=model_params["num_heads"],
+            context_length=context_length
+        )
+        
+        # 预热阶段
+        for _ in range(5):  # 进行5次预热
+            forward()
+            if profile_full_training:
+                backward()
+                optimizer_step()
+        
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            # torch.cuda.empty_cache()
+            
+        # 开始记录内存历史
+        torch.cuda.memory._record_memory_history(max_entries=1000000)
+        
+        # 执行要分析的操作
+        forward()
+        if profile_full_training:
+            backward()
+            optimizer_step()
+            
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        
+        # 保存内存快照
+        profile_type = "full_training" if profile_full_training else "inference"
+        output_file = f"results/memory_profiles/{model_size}_ctx{context_length}_{profile_type}.pickle"
+        torch.cuda.memory._dump_snapshot(output_file)
+        
+        # 停止记录历史
+        torch.cuda.memory._record_memory_history(enabled=None)
+        
+        print(f"已保存内存快照到 {output_file}")
+        
+    print("内存分析完成！")
+    print("请使用PyTorch的内存可视化工具查看结果：https://pytorch.org/memory_viz")
+    print("命令行方式：python -m torch.cuda.memory_viz results/memory_profiles/[snapshot_file]")
 
 if __name__ == "__main__":
-    exp2()
+    # exp2()
+    
+    # 仅前向传递(推理)的内存分析
+    exp3(profile_full_training=False)
+    
+    # 完整训练步骤的内存分析
+    exp3(profile_full_training=True)
